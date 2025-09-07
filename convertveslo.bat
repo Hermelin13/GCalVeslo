@@ -1,0 +1,1 @@
+python gcalveslo.py --months 9 --inter false --calendar family16658134994112439829@group.calendar.google.com --creds rowcalendar-c4af9fb74753.json --page https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1
