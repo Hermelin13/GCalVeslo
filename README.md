@@ -54,3 +54,4 @@ python gcalveslo.py --page "https://www.veslo.cz/zavody/terminovky-vypsani-a-roz
 - Lepší handling Zrušených zavodů (mazat už existující)
 - Kriptograficky heslovane údaje
 - Lepší rozhraní -> .exe
+- Rozdělení na různé typy zaávodu
