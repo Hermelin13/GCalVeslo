@@ -31,14 +31,28 @@ CZECH_MONTHS = {
 }
 
 def fetch_xls_url(page_url: str) -> str:
+    import re
     resp = requests.get(page_url, timeout=30)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
+    xls_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.lower().endswith((".xls",".xlsx")) and "terminova_listina" in href.lower():
-            return urljoin(page_url, href)
-    raise RuntimeError("No Excel (.xls/.xlsx) link found on the page.")
+            # Try to extract date from filename
+            m = re.search(r"(\d{2}_\d{2}_\d{4})", href)
+            date_str = m.group(1) if m else ""
+            xls_links.append((date_str, urljoin(page_url, href)))
+    if not xls_links:
+        raise RuntimeError("No Excel (.xls/.xlsx) link found on the page.")
+    # Sort by date_str descending (newest first)
+    def date_key(x):
+        try:
+            return [int(i) for i in x[0].split("_")][::-1]  # [year, month, day]
+        except:
+            return [0, 0, 0]
+    xls_links.sort(key=date_key, reverse=True)
+    return xls_links[0][1]
 
 def parse_date(cell: str, year: int, current_month: int = None):
     s = str(cell).strip()
@@ -67,10 +81,13 @@ def parse_date(cell: str, year: int, current_month: int = None):
 
     return None, None
 
-def get_row_colors(xls_bytes):
+def get_row_colors(xls_bytes, sheet_name=None):
     with io.BytesIO(xls_bytes) as fh:
         wb = load_workbook(fh, data_only=True)
-    ws = wb.active
+    if sheet_name:
+        ws = wb[sheet_name]
+    else:
+        ws = wb.active
 
     row_inter = {}
     for i, row in enumerate(ws.iter_rows(min_row=3), start=0):
@@ -82,17 +99,19 @@ def get_row_colors(xls_bytes):
         row_inter[i-1] = "true" if italic_found else "false"
     return row_inter
 
-def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None):
+def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None, sheet_name=None):
     with io.BytesIO(xls_bytes) as fh:
-        df = pd.read_excel(fh, header=2)
+        df = pd.read_excel(fh, header=2, sheet_name=sheet_name)
 
-    row_inters = get_row_colors(xls_bytes)
+    row_inters = get_row_colors(xls_bytes, sheet_name)
     events = []
     invalid = []
     current_month = None
 
     for idx, r in df.iterrows():
         raw_date = str(r.get("datum", "")).strip()
+        event_name = str(r.get("název akce", "")).strip()
+
         if raw_date.lower() in CZECH_MONTHS:
             current_month = CZECH_MONTHS[raw_date.lower()]
 
@@ -117,7 +136,7 @@ def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None):
             continue
 
         ev = {
-            "summary": str(r.get("název akce", "")).strip(),
+            "summary": event_name,
             "description": str(r.get("pořadatel", "")).strip(),
             "location": str(r.get("místo", "")).strip(),
             "start_date": start,
@@ -135,19 +154,53 @@ def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None):
 
 def insert_events(service, calendar_id, events, color_id=DEFAULT_COLOR_ID):
     for ev in events:
+        start_date_str = ev["start_date"].isoformat()
+        end_date_str = (ev["end_date"] + timedelta(days=1)).isoformat()
+        # Search for existing events with the same summary (name), regardless of date
+        existing = service.events().list(
+            calendarId=calendar_id,
+            q=ev["summary"],
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        found_same_date = False
+        found_same_date = False
+
+        ev_summary_norm = ev["summary"].strip().lower()
+        for item in existing.get("items", []):
+            item_id = item.get("id")
+            item_summary = item.get("summary", "")
+            item_summary_norm = item_summary.strip().lower()
+            item_start = item.get("start", {}).get("date")
+            item_end = item.get("end", {}).get("date")
+            if item_summary_norm == ev_summary_norm:
+                if item_start == start_date_str and item_end == end_date_str:
+                    found_same_date = True
+                    print(f"nonDeleted event: {item_id}")
+                    break
+            else:
+                print(f"Deleted event: {item_id}")
+                service.events().delete(calendarId=calendar_id, eventId=item_id).execute()
+
+        if found_same_date:
+            print(f"Skipped (already exists): {ev['summary']} ({start_date_str})")
+            continue
+        # Insert new event if not found
         body = {
             "summary": ev["summary"],
             "description": ev["description"],
             "location": ev["location"],
-            "start": {"date": ev["start_date"].isoformat()},
-            "end": {"date": (ev["end_date"] + timedelta(days=1)).isoformat()},
+            "start": {"date": start_date_str},
+            "end": {"date": end_date_str},
             "colorId": str(color_id),
+            "reminders": {"useDefault": False, "overrides": []}
         }
-        created = service.events().insert(calendarId=calendar_id, body=body).execute()
+        created = service.events().insert(calendarId=calendar_id, body=body, sendUpdates='none').execute()
         print(f"Inserted: {created.get('summary')} ({created.get('id')})")
 
 def main():
     current_date = date.today()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", required=True, help="URL of veslo.cz termínovky page")
     ap.add_argument("--year", type=int, default=current_date.year)
@@ -164,8 +217,20 @@ def main():
     print("Downloading Excel...")
     xls_bytes = requests.get(xls_url).content
 
+    # Find the sheet name if --year is provided (default behavior)
+    sheet_name = None
+    if args.year:
+        with io.BytesIO(xls_bytes) as fh:
+            wb = load_workbook(fh, data_only=True)
+            for name in wb.sheetnames:
+                if str(args.year) in name:
+                    sheet_name = name
+                    break
+            if not sheet_name:
+                raise RuntimeError(f"No sheet found with year {args.year} in its name.")
+
     print("Parsing events...")
-    events = xls_to_events(xls_bytes, args.year, args.inter, args.months)
+    events = xls_to_events(xls_bytes, args.year, args.inter, args.months, sheet_name)
 
     print("Connecting to Google Calendar API...")
     creds = service_account.Credentials.from_service_account_file(
