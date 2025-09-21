@@ -1,6 +1,6 @@
 # GCalVeslo
 
-Tento projekt automatizuje přidávání veslařských závodů z veslo.cz do vašeho Google Kalendáře. Načítá oficiální termínové listiny ve formátu Excel a vytváří nebo aktualizuje události ve zvoleném Google Kalendáři.
+Tento projekt automatizuje přidávání veslařských závodů z veslo.cz do vašeho Google Kalendáře. Načítá oficiální termínové listiny ve formátu Excel a vytváří nebo aktualizuje události ve zvoleném Google Kalendáři. V adresáři je i offline verze, která přetvoří excel datumz akcí do Google templatu v CSV.
 
 ## Funkce
 - Stáhne nejnovější oficiální termínovou listinu z veslo.cz
@@ -38,9 +38,7 @@ Tento projekt automatizuje přidávání veslařských závodů z veslo.cz do va
 - `--calendar` (volitelné): ID cílového Google Kalendáře (výchozí: `primary`)
 - `--creds` (povinné): Cesta k JSON souboru s přihlašovacími údaji
 
-**Příklad:
-
-**
+**Příklad:**
 ```sh
 python gcalveslo.py --page "https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1" --year 2025 --creds rowcalendar-c4af9fb74753.json
 ```
