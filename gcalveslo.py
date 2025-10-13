@@ -109,7 +109,18 @@ def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None, sheet
     current_month = None
 
     for idx, r in df.iterrows():
-        raw_date = str(r.get("datum", "")).strip()
+        raw_cell = r.get("datum", "")
+        # Skip empty/NaN date cells
+        if pd.isna(raw_cell):
+            continue
+        raw_date = str(raw_cell).strip()
+        # Some Excel cells may convert to the string 'nan' - skip those too
+        if raw_date.lower() == "nan" or raw_date == "":
+            continue
+        # Skip metadata/summary rows that include this phrase
+        if "údaje jsou" in raw_date.lower():
+            continue
+
         event_name = str(r.get("název akce", "")).strip()
 
         if raw_date.lower() in CZECH_MONTHS:
@@ -144,7 +155,14 @@ def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None, sheet
         }
         events.append(ev)
 
-    print(f"Parsed {len(events)} events (color={inter_filter}, months={months_filter or 'all'}).")
+    # show international flag based on inter_filter
+    if inter_filter == "false":
+        international = "no"
+    elif inter_filter == "true":
+        international = "yes"
+    else:
+        international = "all"
+    print(f"Parsed {len(events)} events (international={international}, months={months_filter or 'all'}).")
     print(f"Skipped {len(invalid)} rows.")
     if invalid:
         print("Examples of skipped rows:")
@@ -153,6 +171,11 @@ def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None, sheet
     return events
 
 def insert_events(service, calendar_id, events, color_id=DEFAULT_COLOR_ID):
+    inserted = []
+    updated = []
+    deleted = []
+    skipped = []
+
     for ev in events:
         start_date_str = ev["start_date"].isoformat()
         end_date_str = (ev["end_date"] + timedelta(days=1)).isoformat()
@@ -176,14 +199,15 @@ def insert_events(service, calendar_id, events, color_id=DEFAULT_COLOR_ID):
             if item_summary_norm == ev_summary_norm:
                 if item_start == start_date_str and item_end == end_date_str:
                     found_same_date = True
-                    print(f"nonDeleted event: {item_id}")
+                    # print(f"nonDeleted event: {item_id}")
                     break
             else:
-                print(f"Deleted event: {item_id}")
+                # print(f"Deleted event: {item_id}")
                 service.events().delete(calendarId=calendar_id, eventId=item_id).execute()
 
         if found_same_date:
-            print(f"Skipped (already exists): {ev['summary']} ({start_date_str})")
+            skipped.append({"summary": ev["summary"], "date": start_date_str})
+            # print(f"Skipped (already exists): {ev['summary']} ({start_date_str})")
             continue
         # Insert new event if not found
         body = {
@@ -196,7 +220,10 @@ def insert_events(service, calendar_id, events, color_id=DEFAULT_COLOR_ID):
             "reminders": {"useDefault": False, "overrides": []}
         }
         created = service.events().insert(calendarId=calendar_id, body=body, sendUpdates='none').execute()
-        print(f"Inserted: {created.get('summary')} ({created.get('id')})")
+        inserted.append({"summary": created.get("summary"), "id": created.get("id"), "date": start_date_str})
+        # print(f"Inserted: {created.get('summary')} ({created.get('id')})")
+
+    return {"inserted": inserted, "updated": updated, "deleted": deleted, "skipped": skipped}
 
 def main():
     current_date = date.today()
@@ -239,8 +266,15 @@ def main():
     )
     service = build("calendar", "v3", credentials=creds)
 
-    print(f"Inserting {len(events)} events into calendar {args.calendar}...")
-    insert_events(service, args.calendar, events)
+    print(f"Inserting {len(events)} events into calendar...")
+    summary = insert_events(service, args.calendar, events)
+
+    # Final concise summary
+    print("\nFinal summary:")
+    print(f"  Inserted: {len(summary.get('inserted', []))}")
+    print(f"  Updated: {len(summary.get('updated', []))}")
+    print(f"  Deleted: {len(summary.get('deleted', []))}")
+    print(f"  Skipped: {len(summary.get('skipped', []))}")
 
 if __name__ == "__main__":
     main()
