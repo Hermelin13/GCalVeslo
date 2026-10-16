@@ -4,8 +4,8 @@ Každých 14 dní načte závody ČVS z webu a vloží chybějící celodenní a
 
 - Českým závodům nastaví barvu z `DOMESTIC_COLOR_ID` (výchozí 9 – modrá).
 - Mezinárodní závody rozpoznává z kurzívy v termínové listině a nastaví barvu 8 – Graphite (uhlíková/šedá).
-- Neimportuje mistrovství světa, mistrovství Evropy ani světový pohár (včetně základních anglických názvů). **Tyto akce jsou vynechány**, nikoli zapsány jako šedé.
-- Při shodě normalizovaného názvu, data začátku a data konce se událost nevkládá podruhé. Nikdy nemaže ani nemění stávající události, dokonce ani ty cizí.
+- Neimportuje mistrovství světa ani Evropy v žádné veslařské disciplíně (včetně Indoor, Coastal Rowing, Beach Sprint, Masters, U23 a Junior Championships), světové/evropské poháry ani samostatně pojmenované Indoor Championships a Coastal Rowing Championships. **Tyto akce jsou vynechány**, nikoli zapsány jako šedé. Mistrovství ČR a běžné regaty zůstávají.
+- Při shodě normalizovaného názvu a dne začátku se událost nevkládá podruhé, i když má jiné datum konce, jiné zdrojové XLSX nebo jde o časovanou událost v cílovém kalendáři. Duplicity se odstraňují jak mezi staženými zdroji, tak vůči existujícím událostem v Google Kalendáři. Nikdy nemaže ani nemění stávající události, dokonce ani ty cizí.
 - Hledá nové soubory na webu při každém spuštění; nepředpokládá, že budoucí soubor už existuje. Pokud není k dispozici, importuje dostupné závody; nic nemaže.
 - Pokud zdroje nelze přečíst, proces skončí chybou a GitHub Actions může zaslat e-mail přes SMTP.
 
@@ -67,3 +67,7 @@ o `eventLabelId` a `eventLabelVersion=1` a vytvoření příslušných štítků
 Nezaměňujte novější štítky s číselnými hodnotami `DOMESTIC_COLOR_ID=1..11`.
 Dokud není vybrána nová barva a implementace štítků, program nadále používá
 stávající barvy, včetně grafitové (8) pro mezinárodní závody.
+
+### Rozšířený filtr mistrovství
+
+Import vynechává také zkratky **MS, ME, WRICH, WRCH, ERICH, ERCH, WRBSCH a WRC** a akce označené **Para Rowing / paraveslování**. České mistrovství ČR a běžné regaty zůstávají povolené. Filtr se uplatní jen na nové importy; již zapsané akce automaticky nemaže.

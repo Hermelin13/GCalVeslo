@@ -21,7 +21,25 @@ from openpyxl import load_workbook
 PAGE = 'https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1'
 COLORS = {str(i): name for i, name in enumerate(['', 'Lavender', 'Sage', 'Grape', 'Flamingo', 'Banana', 'Tangerine', 'Peacock', 'Graphite', 'Blueberry', 'Basil', 'Tomato']) if i}
 MONTHS = dict(zip(('leden únor březen duben květen červen červenec srpen září říjen listopad prosinec').split(), range(1,13)))
-EXCLUDED = re.compile(r'\b(mistrovstv[ií]\s+(sv[eě]ta|evropy)|sv[eě]tov[yý]\s+poh[aá]r|world\s+rowing\s+cup|world\s+(rowing\s+)?championships?|european\s+(rowing\s+)?championships?|world\s+cup)\b', re.I)
+# Exclude world/European championship variants in every rowing discipline,
+# plus Indoor and Coastal Rowing Championships even when the region is omitted.
+# Keep domestic championships (e.g. Mistrovství ČR) and ordinary regattas.
+EXCLUDED = re.compile(
+    r"\b(?:"
+    r"mistrovstv[ií]\s+(?:sv[eě]ta|evropy)"
+    r"|(?:MS|ME)(?=\s|\b|[-–—])"
+    r"|(?:WRICH|WRCH|ERICH|ERCH|WRBSCH|WRC)(?=\s|\b|[-–—])"
+    r"|(?:para[ -]?rowing|paraveslov[aá]n[ií])\b"
+    r"|sv[eě]tov[yý]\s+poh[aá]r"
+    r"|(?:world|european)\s+cup"
+    r"|(?:world|european)\s+(?:[\w-]+\s+){0,8}championships?\b"
+    r"|(?:indoor|coastal(?:\s+rowing)?)\s+championships?\b"
+    r"|(?:championships?\s+(?:of\s+the\s+)?(?:world|europe))\b"
+    r"|(?:mistrovstv[ií]\s+(?:sv[eě]ta|evropy)\s+(?:v|ve)\s+[^,;]+)"
+    r")",
+    re.I,
+)
+
 LOG = logging.getLogger('gcalveslo')
 
 
@@ -192,7 +210,9 @@ def load_events(session, page, today):
 
 
 def event_key(ev):
-    return (norm(ev['summary']), str(ev['start']), str(ev['end']))
+    # Same normalized title on the same starting calendar day is one race,
+    # regardless of the reported end date or source workbook.
+    return (norm(ev['summary']), str(ev['start']))
 
 
 def credentials():
@@ -224,10 +244,11 @@ def sync(service, calendar_id, events, today, until, domestic_color, dry_run=Fal
     for ev in existing:
         if ev.get('status') == 'cancelled':
             continue
-        start = ev.get('start',{}).get('date')
-        end = ev.get('end',{}).get('date')
-        if start and end:
-            keys.add((norm(ev.get('summary','')),start,end))
+        start_info = ev.get('start', {})
+        # Match both all-day and timed events already in the calendar.
+        start = start_info.get('date') or start_info.get('dateTime', '')[:10]
+        if start:
+            keys.add((norm(ev.get('summary','')), start))
     added = skipped = 0
     for ev in sorted(events,key=lambda e:(e['start'],e['summary'])):
         key = tuple(map(str,event_key(ev)))

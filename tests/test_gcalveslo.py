@@ -1,5 +1,5 @@
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import Mock
 import sys
 from pathlib import Path
@@ -15,6 +15,52 @@ class Tests(unittest.TestCase):
         self.assertTrue(EXCLUDED.search('Mistrovství světa ve veslování'))
         self.assertTrue(EXCLUDED.search('Světový pohár'))
         self.assertFalse(EXCLUDED.search('Pohár ČR'))
+        for name in (
+            'World Rowing Indoor Championships',
+            'World Rowing Coastal Championships',
+            'World Rowing Beach Sprint Championships',
+            'World Rowing Under 23 Championships',
+            'World Rowing Masters Championships',
+            'World Rowing Junior Championships',
+            'World Championships',
+            'European Rowing Coastal Championships',
+            'European Indoor Rowing Championships',
+            'Indoor Championships',
+            'Coastal Rowing Championships',
+            'World Rowing Cup II',
+            'MS ve veslování', 'ME ve veslování',
+            'WRICH 2027', 'WRCH', 'ERICH', 'ERCH', 'WRBSCH',
+            'World Rowing Para Rowing Championships',
+            'Para Rowing International Regatta', 'Para-veslování',
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(EXCLUDED.search(name), name)
+        for name in ('Mistrovství ČR', 'Národní mistrovství', 'Pražské primátorky', 'International Regatta'):
+            with self.subTest(name=name):
+                self.assertFalse(EXCLUDED.search(name), name)
+    def test_same_name_day_even_if_end_differs(self):
+        self.assertEqual(event_key(dict(summary='  ČESKÁ  REGATA ', start=date(2027,5,2), end=date(2027,5,3))),
+                         event_key(dict(summary='česká regata', start=date(2027,5,2), end=date(2027,5,4))))
+
+    def test_duplicate_in_input_only_insert_once(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {'items': []}
+        first = dict(summary='Regata', start=date(2027,5,2), end=date(2027,5,3),
+                     description='',location='',international=False,source='https://veslo.cz/a')
+        second = dict(first, summary=' regata ', end=date(2027,5,4), source='https://veslo.cz/b')
+        self.assertEqual(sync(service,'calendar',[first,second],date(2027,1,1),date(2028,1,1),'9'), (1,1))
+        self.assertEqual(service.events.return_value.insert.call_count, 1)
+
+    def test_existing_timed_event_blocks_import(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            'items':[{'summary':'REGATA', 'start':{'dateTime':'2027-05-02T09:00:00+02:00'},
+                      'end':{'dateTime':'2027-05-02T16:00:00+02:00'}}]}
+        event = dict(summary='Regata',start=date(2027,5,2),end=date(2027,5,4),
+                     description='',location='',international=False,source='https://veslo.cz/a')
+        self.assertEqual(sync(service,'calendar',[event],date(2027,1,1),date(2028,1,1),'9'),(0,1))
+        service.events.return_value.insert.assert_not_called()
+
     def test_duplicate_no_delete(self):
         service = Mock()
         service.events.return_value.list.return_value.execute.return_value = {'items':[{'summary':'Regata', 'start':{'date':'2026-11-03'}, 'end':{'date':'2026-11-04'}}]}
