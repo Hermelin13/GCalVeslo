@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from gcalveslo import parse_day, event_key, sync, EXCLUDED
+from gcalveslo import parse_day, event_key, sync, EXCLUDED, is_excluded
 
 class Tests(unittest.TestCase):
     def test_dates(self):
@@ -42,6 +42,29 @@ class Tests(unittest.TestCase):
         for name in ('Mistrovství ČR', 'Národní mistrovství', 'Pražské primátorky', 'International Regatta', 'Kontrolní závody juniorů', 'Kontrolní závody seniorů', 'Kontrolní závody seniorů A', 'Český pohár v beach sprintu'):
             with self.subTest(name=name):
                 self.assertFalse(EXCLUDED.search(name), name)
+    def test_excluded_items_never_reach_google_even_if_supplied_directly(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {'items': []}
+        base = dict(start=date(2027, 6, 19), end=date(2027, 6, 21),
+                    description='', location='', international=True, source='https://veslo.cz/a')
+        bad_titles = (
+            'World Rowing Beach Sprint Finals',
+            'World Rowing Beach Sprint Series I.kolo',
+            'World Rowing Indoor Championships',
+            'WRICH 2027',
+            'World Rowing Para Rowing Championships',
+            '4th European Games',
+            'Coupe de la Jeunesse 2027',
+            'YOG Dakar 2026 - coastal rowing',
+        )
+        good = dict(base, summary='Kontrolní závody seniorů A', international=False)
+        events = [dict(base, summary=name) for name in bad_titles] + [good]
+        self.assertEqual(sync(service, 'calendar', events, date(2027, 1, 1),
+                              date(2028, 1, 1), '9'), (1, len(bad_titles)))
+        calls = service.events.return_value.insert.call_args_list
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].kwargs['body']['summary'], good['summary'])
+
     def test_same_name_day_even_if_end_differs(self):
         self.assertEqual(event_key(dict(summary='  ČESKÁ  REGATA ', start=date(2027,5,2), end=date(2027,5,3))),
                          event_key(dict(summary='česká regata', start=date(2027,5,2), end=date(2027,5,4))))

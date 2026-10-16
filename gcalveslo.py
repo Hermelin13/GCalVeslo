@@ -29,9 +29,9 @@ EXCLUDED = re.compile(
     r"mistrovstv[ií]\s+(?:sv[eě]ta|evropy)"
     r"|(?:MS|ME)(?=\s|\b|[-–—])"
     r"|(?:WRICH|WRCH|ERICH|ERCH|WRBSCH|WRC)(?=\s|\b|[-–—])"
-    r"|(?:para[ -]?rowing|paraveslov[aá]n[ií])\b"
+    r"|(?:para[ -]?rowing|para[ -]?veslov[aá]n[ií])\b"
     r"|sv[eě]tov[yý]\s+poh[aá]r"
-    r"|(?:world|european)\s+cup"
+    r"|(?:world|european)(?:\s+rowing)?\s+cup"
     r"|(?:world|european)\s+(?:[\w-]+\s+){0,8}championships?\b"
     r"|(?:indoor|coastal(?:\s+rowing)?)\s+championships?\b"
     r"|(?:championships?\s+(?:of\s+the\s+)?(?:world|europe))\b"
@@ -166,7 +166,8 @@ def workbook_events(payload, desired_years, start_window, stop_window, source_ur
                 name = str(title_cell.value or '').strip() if title_cell else ''
                 if not name or name.casefold() == 'nan':
                     continue
-                if EXCLUDED.search(name):
+                if is_excluded(name):
+                    LOG.info('Excluded from source: %s', name)
                     continue
                 organizer = cell('poradatel')
                 location = cell('misto')
@@ -210,7 +211,13 @@ def load_events(session, page, today):
     if not successfully_read:
         raise RuntimeError('Could not parse any published term list. Calendar unchanged.')
     LOG.info('Read %d unique races from %d workbooks',len(events),successfully_read)
-    return list(events.values()),end
+    # Last safety check before returning records to any caller.
+    return [ev for ev in events.values() if not is_excluded(ev['summary'])],end
+
+
+def is_excluded(title):
+    """One shared exclusion policy, checked at extraction AND insertion."""
+    return bool(EXCLUDED.search(str(title or '')))
 
 
 def canonical_title(title):
@@ -269,6 +276,11 @@ def sync(service, calendar_id, events, today, until, domestic_color, dry_run=Fal
         LOG.warning('Already duplicated in target calendar: %s | %s | %d occurrences (no deletion)', day, name, count)
     added = skipped = 0
     for ev in sorted(events,key=lambda e:(e['start'],e['summary'])):
+        # Defense in depth: never write excluded events, even from another importer.
+        if is_excluded(ev['summary']):
+            LOG.info('Excluded before calendar insert: %s', ev['summary'])
+            skipped += 1
+            continue
         key = tuple(map(str,event_key(ev)))
         if key in keys:
             skipped += 1

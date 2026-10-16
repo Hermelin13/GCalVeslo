@@ -87,3 +87,13 @@ pokud najde dvě existující události se stejným názvem a datem začátku.
 Další kopie nevytvoří, ale existující záznamy kvůli ochraně ostatních
 událostí automaticky nemaže. Pokud události vidíš dvakrát v Google Calendar,
 ověř, zda obě patří do stejného kalendáře (nejsou z překrývajících se kalendářů).
+
+
+### Dvojitá kontrola filtru (oprava 2026-10-16)
+
+Zakázané závody se nyní vynechávají při čtení XLSX **a znovu těsně před
+`events().insert()`**. Tím se nepropíše ani World Rowing Beach Sprint Finals,
+Beach Sprint Series, WRICH, mezinárodní PARA Rowing, YOG, European Games ani
+Coupe de la Jeunesse, pokud by se do importu dostaly jinou cestou.
+Povolené české závody (včetně Kontrolních závodů seniorů A) zůstávají.
+Existující položky v kalendáři se nemažou.
