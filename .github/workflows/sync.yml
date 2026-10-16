@@ -1,0 +1,50 @@
+name: Import rowing races
+on:
+  schedule:
+    - cron: '17 7 * * 1'
+      timezone: 'Europe/Prague'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rowing-calendar-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+      GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+      DOMESTIC_COLOR_ID: ${{ vars.DOMESTIC_COLOR_ID || '9' }}
+      ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run at most once per 14 days
+        id: check
+        run: |
+          python - <<'PY'
+          import datetime, os
+          # Fixed biweekly Monday cycle. Manual runs always run.
+          monday = datetime.date.today()
+          anchor = datetime.date(2026, 10, 19)
+          run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch' or ((monday-anchor).days % 14 == 0)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write(f'run={str(run).lower()}\n')
+          PY
+      - name: Import
+        if: steps.check.outputs.run == 'true'
+        run: python gcalveslo.py
+      - name: Email failure alert
+        if: failure()
+        run: python notify_failure.py
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

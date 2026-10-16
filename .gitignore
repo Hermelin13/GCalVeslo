@@ -1,0 +1,62 @@
+# Credentials and local configuration — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.crt
+*credentials*.json
+*credential*.json
+*service-account*.json
+*service_account*.json
+*token*.json
+*secret*.json
+*secrets*.json
+*firebase-adminsdk*.json
+rowcalendar-*.json
+
+# Local race downloads and generated calendar exports
+*.csv
+*.ics
+*.xls
+*.xlsx
+*.xlsm
+*.ods
+/downloads/
+/output/
+/exports/
+/tmp/
+/temp/
+
+# Python caches, environments, builds
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editors / operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Logs and scratch files
+*.log
+*.tmp
+*.bak

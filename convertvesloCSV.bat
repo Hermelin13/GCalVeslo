@@ -1,1 +1,0 @@
-python gcalveslo.py --page https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1 --out veslo_2025_gcal.csv --months 9 --inter false 

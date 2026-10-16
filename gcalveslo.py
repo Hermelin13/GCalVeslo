@@ -1,280 +1,280 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+"""Synchronize rowing events from ČVS workbooks into Google Calendar."""
 import argparse
+import base64
 import io
+import logging
+import os
 import re
-from datetime import date, timedelta
-from urllib.parse import urljoin
+import sys
+import time
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urljoin, urlparse
 
-import pandas as pd
 import requests
-from openpyxl import load_workbook
 from bs4 import BeautifulSoup
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from openpyxl import load_workbook
 
-# Event color IDs supported by Google Calendar (1–11)
-DEFAULT_COLOR_ID = "8"  # gray
+PAGE = 'https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1'
+COLORS = {str(i): name for i, name in enumerate(['', 'Lavender', 'Sage', 'Grape', 'Flamingo', 'Banana', 'Tangerine', 'Peacock', 'Graphite', 'Blueberry', 'Basil', 'Tomato']) if i}
+MONTHS = dict(zip(('leden únor březen duben květen červen červenec srpen září říjen listopad prosinec').split(), range(1,13)))
+EXCLUDED = re.compile(r'\b(mistrovstv[ií]\s+(sv[eě]ta|evropy)|sv[eě]tov[yý]\s+poh[aá]r|world\s+rowing\s+cup|world\s+(rowing\s+)?championships?|european\s+(rowing\s+)?championships?|world\s+cup)\b', re.I)
+LOG = logging.getLogger('gcalveslo')
 
-# Regex for parsing dates
-CROSS_MONTH = re.compile(r"(\d{1,2})\.?\s*-\s*(\d{1,2})\.(\d{1,2})")
-RANGE_SAME  = re.compile(r"(\d{1,2})\.?\s*-\s*(\d{1,2})\.?\s*(\d{1,2})")
-SINGLE      = re.compile(r"(\d{1,2})\.?\s*(\d{1,2})\.?")
-RANGE_NO_MONTH = re.compile(r"^\s*(\d{1,2})\.?\s*-\s*(\d{1,2})\.?\s*$")
 
-CZECH_MONTHS = {
-    "leden": 1, "únor": 2, "březen": 3, "duben": 4,
-    "květen": 5, "červen": 6, "červenec": 7, "srpen": 8,
-    "září": 9, "říjen": 10, "listopad": 11, "prosinec": 12
-}
+def norm(s):
+    return ' '.join(unicodedata.normalize('NFKC', str(s or '')).casefold().split())
 
-def fetch_xls_url(page_url: str) -> str:
-    import re
-    resp = requests.get(page_url, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    xls_links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.lower().endswith((".xls",".xlsx")) and "terminova_listina" in href.lower():
-            # Try to extract date from filename
-            m = re.search(r"(\d{2}_\d{2}_\d{4})", href)
-            date_str = m.group(1) if m else ""
-            xls_links.append((date_str, urljoin(page_url, href)))
-    if not xls_links:
-        raise RuntimeError("No Excel (.xls/.xlsx) link found on the page.")
-    # Sort by date_str descending (newest first)
-    def date_key(x):
+
+def get(session, url):
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        raise ValueError('Only HTTPS sources are allowed')
+    for attempt in range(3):
         try:
-            return [int(i) for i in x[0].split("_")][::-1]  # [year, month, day]
-        except:
-            return [0, 0, 0]
-    xls_links.sort(key=date_key, reverse=True)
-    return xls_links[0][1]
+            response = session.get(url, timeout=(10, 45))
+            response.raise_for_status()
+            if len(response.content) > 15_000_000:
+                raise ValueError('Source too large')
+            return response.content
+        except (requests.RequestException,) as exc:
+            if attempt == 2:
+                raise RuntimeError(f'Download failed: {parsed.hostname}') from exc
+            time.sleep(2 ** attempt)
 
-def parse_date(cell: str, year: int, current_month: int = None):
-    s = str(cell).strip()
-    if not s or s.lower().startswith(tuple(CZECH_MONTHS.keys())):
-        return None, None
 
-    m = CROSS_MONTH.match(s)
+def sources(session, page):
+    soup = BeautifulSoup(get(session, page), 'html.parser')
+    found = []
+    for a in soup.find_all('a', href=True):
+        href = urljoin(page, a['href'])
+        path = urlparse(href).path.lower()
+        label = a.get_text(' ', strip=True)
+        if not path.endswith('.xlsx') and not path.endswith('.xls'):
+            continue
+        if 'term' not in norm(label) and 'termin' not in path:
+            continue
+        years = [int(y) for y in re.findall(r'20\d{2}', label + ' ' + path)]
+        # Prefer explicit year-spanning sheets (e.g. 2026–2028), then latest files.
+        priority = max(years, default=0)
+        found.append((priority, href))
+    return [url for _, url in sorted(set(found), reverse=True)]
+
+
+def parse_day(value, year, month):
+    if isinstance(value, (date, datetime)):
+        d = value.date() if isinstance(value, datetime) else value
+        return d, d
+    s = str(value or '').strip().replace('–', '-').replace('—', '-')
+    if not s or s.casefold() in MONTHS:
+        return None
+    m = re.fullmatch(r'(\d{1,2})\.\s*(\d{1,2})\.?(?:\s*-\s*(\d{1,2})\.\s*(\d{1,2})\.?)?', s)
     if m:
-        d1, d2, m2 = map(int, m.groups())
-        return date(year, m2, d1), date(year, m2, d2)
-
-    m = RANGE_SAME.match(s)
+        d1, mon1, d2, mon2 = m.groups()
+        return date(year, int(mon1), int(d1)), date(year, int(mon2), int(d2)) if d2 else date(year, int(mon1), int(d1))
+    m = re.fullmatch(r'(\d{1,2})\.?\s*-\s*(\d{1,2})\.\s*(\d{1,2})\.?', s)
     if m:
-        d1, d2, mth = map(int, m.groups())
-        return date(year, mth, d1), date(year, mth, d2)
-
-    m = SINGLE.match(s)
+        a,b,mo = map(int,m.groups())
+        return date(year,mo,a),date(year,mo,b)
+    m = re.fullmatch(r'(\d{1,2})\.?\s*-\s*(\d{1,2})\.?', s)
+    if m and month:
+        a,b = map(int,m.groups())
+        return date(year,month,a),date(year,month,b)
+    m = re.fullmatch(r'(\d{1,2})\.?\s*(\d{1,2})\.?',s)
     if m:
-        d, mth = map(int, m.groups())
-        return date(year, mth, d), date(year, mth, d)
+        a,mo = map(int,m.groups())
+        return date(year,mo,a),date(year,mo,a)
+    return None
 
-    m = RANGE_NO_MONTH.match(s)
-    if m and current_month:
-        d1, d2 = map(int, m.groups())
-        return date(year, current_month, d1), date(year, current_month, d2)
 
-    return None, None
-
-def get_row_colors(xls_bytes, sheet_name=None):
-    with io.BytesIO(xls_bytes) as fh:
-        wb = load_workbook(fh, data_only=True)
-    if sheet_name:
-        ws = wb[sheet_name]
-    else:
-        ws = wb.active
-
-    row_inter = {}
-    for i, row in enumerate(ws.iter_rows(min_row=3), start=0):
-        fcell = row[2]
-        if fcell.fill.fgColor.rgb == "FFFFFF00":
-            row_inter[i-1] = "skip"
+def workbook_events(payload, desired_years, start_window, stop_window, source_url):
+    wb = load_workbook(io.BytesIO(payload), read_only=False, data_only=True)
+    result = []
+    for ws in wb.worksheets:
+        sheet_years = [int(y) for y in re.findall(r'20\d{2}', ws.title)]
+        if len(sheet_years) == 2 and sheet_years[0] < sheet_years[1] and sheet_years[1] - sheet_years[0] <= 5:
+            sheet_years = list(range(sheet_years[0], sheet_years[1]+1))
+        # Single-year sheets must be identified; never apply an arbitrary year to an unknown sheet.
+        if not sheet_years:
             continue
-        italic_found = any(cell.font.i for cell in row[:4])
-        row_inter[i-1] = "true" if italic_found else "false"
-    return row_inter
-
-def xls_to_events(xls_bytes, year, inter_filter="all", months_filter=None, sheet_name=None):
-    with io.BytesIO(xls_bytes) as fh:
-        df = pd.read_excel(fh, header=2, sheet_name=sheet_name)
-
-    row_inters = get_row_colors(xls_bytes, sheet_name)
-    events = []
-    invalid = []
-    current_month = None
-
-    for idx, r in df.iterrows():
-        raw_cell = r.get("datum", "")
-        # Skip empty/NaN date cells
-        if pd.isna(raw_cell):
+        if len(sheet_years) != 1:
+            LOG.warning('Skipping ambiguous multi-year sheet: %s', ws.title)
             continue
-        raw_date = str(raw_cell).strip()
-        # Some Excel cells may convert to the string 'nan' - skip those too
-        if raw_date.lower() == "nan" or raw_date == "":
+        for year in desired_years:
+            if year not in sheet_years:
+                continue
+            headers = None
+            month = None
+            for row in ws.iter_rows():
+                values = [norm(cell.value) for cell in row]
+                if 'datum' in values and ('nazev akce' in unaccent_list(values) or 'název akce' in values):
+                    headers = {unaccent(v): i for i,v in enumerate(values)}
+                    continue
+                if not headers:
+                    continue
+                def cell(key):
+                    i = headers.get(key)
+                    return row[i] if i is not None and i < len(row) else None
+                raw = cell('datum')
+                if raw is None or raw.value is None:
+                    continue
+                raw_date = str(raw.value).strip()
+                if norm(raw_date) in MONTHS:
+                    month = MONTHS[norm(raw_date)]
+                    continue
+                # Historic Excel: yellow highlighted rows are administrative/non-race rows.
+                flag_cell = row[2] if len(row) > 2 else raw
+                fg = flag_cell.fill.fgColor if flag_cell.fill else None
+                if fg and fg.type == 'rgb' and str(fg.rgb).upper().endswith('FFFF00'):
+                    continue
+                try:
+                    parsed = parse_day(raw.value, year, month)
+                except ValueError:
+                    LOG.warning('Invalid date in sheet %s: %s', ws.title, raw_date)
+                    continue
+                if not parsed:
+                    continue
+                first,last = parsed
+                if first > last or last < start_window or first >= stop_window:
+                    continue
+                title_cell = cell('nazev akce')
+                name = str(title_cell.value or '').strip() if title_cell else ''
+                if not name or name.casefold() == 'nan':
+                    continue
+                if EXCLUDED.search(name):
+                    continue
+                organizer = cell('poradatel')
+                location = cell('misto')
+                # Original ČVS workbooks distinguish foreign competitions by italic text.
+                international = any(c.font and c.font.italic for c in row[:4])
+                result.append(dict(summary=name, start=first, end=last+timedelta(days=1),
+                                   description=str(organizer.value or '').strip() if organizer else '',
+                                   location=str(location.value or '').strip() if location else '',
+                                   international=international, source=source_url))
+    return result
+
+
+def unaccent(s):
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+
+def unaccent_list(items):
+    return [unaccent(s) for s in items]
+
+
+def load_events(session, page, today):
+    end = today.replace(year=today.year+1) if not (today.month == 2 and today.day == 29) else today+timedelta(days=365)
+    urls = sources(session, page)
+    if not urls:
+        raise RuntimeError('No term list spreadsheets found on the publisher page')
+    events = {}
+    successfully_read = 0
+    for url in urls:
+        if not urlparse(url).path.lower().endswith('.xlsx'):
+            LOG.warning('Unsupported old Excel .xls source: %s', urlparse(url).path)
             continue
-        # Skip metadata/summary rows that include this phrase
-        if "údaje jsou" in raw_date.lower():
+        try:
+            items = workbook_events(get(session,url), {today.year,end.year},today,end,url)
+            successfully_read += 1
+        except Exception as exc:
+            LOG.warning('Skipping unreadable workbook %s: %s',urlparse(url).path, type(exc).__name__)
             continue
+        for ev in items:
+            key = event_key(ev)
+            events.setdefault(key, ev)
+    if not successfully_read:
+        raise RuntimeError('Could not parse any published term list. Calendar unchanged.')
+    LOG.info('Read %d unique races from %d workbooks',len(events),successfully_read)
+    return list(events.values()),end
 
-        event_name = str(r.get("název akce", "")).strip()
 
-        if raw_date.lower() in CZECH_MONTHS:
-            current_month = CZECH_MONTHS[raw_date.lower()]
+def event_key(ev):
+    return (norm(ev['summary']), str(ev['start']), str(ev['end']))
 
-        row_inter = row_inters.get(idx, "false")
-        if inter_filter != "all" and row_inter != inter_filter:
+
+def credentials():
+    value = os.environ.get('GOOGLE_CREDENTIALS_B64')
+    if not value:
+        raise RuntimeError('Set GOOGLE_CREDENTIALS_B64 to base64 encoded service account JSON')
+    try:
+        import json
+        info = json.loads(base64.b64decode(value, validate=True))
+        return service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/calendar.events'])
+    except Exception as exc:
+        raise RuntimeError('Invalid Google credentials') from exc
+
+
+def existing_events(service, calendar_id, start, end):
+    current, token = [], None
+    while True:
+        response = service.events().list(calendarId=calendar_id, timeMin=start.isoformat()+'T00:00:00Z',
+            timeMax=end.isoformat()+'T00:00:00Z',singleEvents=True,maxResults=2500,pageToken=token).execute()
+        current.extend(response.get('items',[]))
+        token = response.get('nextPageToken')
+        if not token:
+            return current
+
+
+def sync(service, calendar_id, events, today, until, domestic_color, dry_run=False):
+    existing = existing_events(service,calendar_id,today,until)
+    keys = set()
+    for ev in existing:
+        if ev.get('status') == 'cancelled':
             continue
-        if row_inter == "skip":
+        start = ev.get('start',{}).get('date')
+        end = ev.get('end',{}).get('date')
+        if start and end:
+            keys.add((norm(ev.get('summary','')),start,end))
+    added = skipped = 0
+    for ev in sorted(events,key=lambda e:(e['start'],e['summary'])):
+        key = tuple(map(str,event_key(ev)))
+        if key in keys:
+            skipped += 1
             continue
+        body = {'summary':ev['summary'], 'description': ev['description']+'\nZdroj: '+ev['source'],
+                'location':ev['location'], 'start':{'date':ev['start'].isoformat()},
+                'end':{'date':ev['end'].isoformat()}, 'colorId':'8' if ev['international'] else domestic_color,
+                'reminders':{'useDefault':False,'overrides':[]},
+                'extendedProperties':{'private':{'gcalveslo':'1'}}}
+        if not dry_run:
+            service.events().insert(calendarId=calendar_id,body=body,sendUpdates='none').execute()
+        keys.add(key)
+        added += 1
+    LOG.info('%s: %d, already present: %d, deleted: 0', 'Would add' if dry_run else 'Added',added,skipped)
+    return added,skipped
 
-        start, end = parse_date(raw_date, year, current_month)
-        if not start:
-            if raw_date.lower() not in CZECH_MONTHS:
-                invalid.append({
-                    **r.to_dict(),
-                    "row_index": idx,
-                    "reason": f"unrecognized date format: {raw_date}",
-                    "color": row_inter
-                })
-            continue
-
-        if months_filter and start.month not in months_filter:
-            continue
-
-        ev = {
-            "summary": event_name,
-            "description": str(r.get("pořadatel", "")).strip(),
-            "location": str(r.get("místo", "")).strip(),
-            "start_date": start,
-            "end_date": end,
-        }
-        events.append(ev)
-
-    # show international flag based on inter_filter
-    if inter_filter == "false":
-        international = "no"
-    elif inter_filter == "true":
-        international = "yes"
-    else:
-        international = "all"
-    print(f"Parsed {len(events)} events (international={international}, months={months_filter or 'all'}).")
-    print(f"Skipped {len(invalid)} rows.")
-    if invalid:
-        print("Examples of skipped rows:")
-        for bad in invalid[:5]:
-            print(f"Row {bad['row_index']} | {bad.get('datum')} | reason: {bad['reason']}")
-    return events
-
-def insert_events(service, calendar_id, events, color_id=DEFAULT_COLOR_ID):
-    inserted = []
-    updated = []
-    deleted = []
-    skipped = []
-
-    for ev in events:
-        start_date_str = ev["start_date"].isoformat()
-        end_date_str = (ev["end_date"] + timedelta(days=1)).isoformat()
-        # Search for existing events with the same summary (name), regardless of date
-        existing = service.events().list(
-            calendarId=calendar_id,
-            q=ev["summary"],
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
-        found_same_date = False
-        found_same_date = False
-
-        ev_summary_norm = ev["summary"].strip().lower()
-        for item in existing.get("items", []):
-            item_id = item.get("id")
-            item_summary = item.get("summary", "")
-            item_summary_norm = item_summary.strip().lower()
-            item_start = item.get("start", {}).get("date")
-            item_end = item.get("end", {}).get("date")
-            if item_summary_norm == ev_summary_norm:
-                if item_start == start_date_str and item_end == end_date_str:
-                    found_same_date = True
-                    # print(f"nonDeleted event: {item_id}")
-                    break
-            else:
-                # print(f"Deleted event: {item_id}")
-                service.events().delete(calendarId=calendar_id, eventId=item_id).execute()
-
-        if found_same_date:
-            skipped.append({"summary": ev["summary"], "date": start_date_str})
-            # print(f"Skipped (already exists): {ev['summary']} ({start_date_str})")
-            continue
-        # Insert new event if not found
-        body = {
-            "summary": ev["summary"],
-            "description": ev["description"],
-            "location": ev["location"],
-            "start": {"date": start_date_str},
-            "end": {"date": end_date_str},
-            "colorId": str(color_id),
-            "reminders": {"useDefault": False, "overrides": []}
-        }
-        created = service.events().insert(calendarId=calendar_id, body=body, sendUpdates='none').execute()
-        inserted.append({"summary": created.get("summary"), "id": created.get("id"), "date": start_date_str})
-        # print(f"Inserted: {created.get('summary')} ({created.get('id')})")
-
-    return {"inserted": inserted, "updated": updated, "deleted": deleted, "skipped": skipped}
 
 def main():
-    current_date = date.today()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--page',default=PAGE)
+    p.add_argument('--calendar',default=os.environ.get('GOOGLE_CALENDAR_ID'))
+    p.add_argument('--domestic-color',default=os.environ.get('DOMESTIC_COLOR_ID','9'), choices=list(COLORS))
+    p.add_argument('--dry-run',action='store_true',help='Preview without Google authentication or writes')
+    p.add_argument('--list-colors',action='store_true')
+    args=p.parse_args()
+    if args.list_colors:
+        for i,name in COLORS.items(): print(f'{i}: {name}')
+        return
+    logging.basicConfig(level=logging.INFO,format='%(levelname)s %(message)s')
+    today=date.today()
+    with requests.Session() as session:
+        events,until=load_events(session,args.page,today)
+    LOG.info('Date window: %s to %s (exclusive)',today,until)
+    LOG.info('Domestic races: %s, foreign races: %s',sum(not x['international'] for x in events),sum(x['international'] for x in events))
+    if args.dry_run:
+        for e in events:
+            print(f"{e['start']} | {'INT' if e['international'] else 'CZ '} | {e['summary']}")
+        return
+    if not args.calendar:
+        raise RuntimeError('GOOGLE_CALENDAR_ID is required')
+    service=build('calendar','v3',credentials=credentials(),cache_discovery=False)
+    sync(service,args.calendar,events,today,until,args.domestic_color)
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--page", required=True, help="URL of veslo.cz termínovky page")
-    ap.add_argument("--year", type=int, default=current_date.year)
-    ap.add_argument("--months", nargs="*", type=int)
-    ap.add_argument("--inter", choices=["all", "true", "false"], default="all")
-    ap.add_argument("--calendar", default="primary", help="Target Google Calendar ID")
-    ap.add_argument("--creds", required=True, help="Path to service account JSON credentials")
-    args = ap.parse_args()
-
-    print("Looking for Excel file...")
-    xls_url = fetch_xls_url(args.page)
-    print(f"Found: {xls_url}")
-
-    print("Downloading Excel...")
-    xls_bytes = requests.get(xls_url).content
-
-    # Find the sheet name if --year is provided (default behavior)
-    sheet_name = None
-    if args.year:
-        with io.BytesIO(xls_bytes) as fh:
-            wb = load_workbook(fh, data_only=True)
-            for name in wb.sheetnames:
-                if str(args.year) in name:
-                    sheet_name = name
-                    break
-            if not sheet_name:
-                raise RuntimeError(f"No sheet found with year {args.year} in its name.")
-
-    print("Parsing events...")
-    events = xls_to_events(xls_bytes, args.year, args.inter, args.months, sheet_name)
-
-    print("Connecting to Google Calendar API...")
-    creds = service_account.Credentials.from_service_account_file(
-        args.creds,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds)
-
-    print(f"Inserting {len(events)} events into calendar...")
-    summary = insert_events(service, args.calendar, events)
-
-    # Final concise summary
-    print("\nFinal summary:")
-    print(f"  Inserted: {len(summary.get('inserted', []))}")
-    print(f"  Updated: {len(summary.get('updated', []))}")
-    print(f"  Deleted: {len(summary.get('deleted', []))}")
-    print(f"  Skipped: {len(summary.get('skipped', []))}")
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':
+    try: main()
+    except Exception as exc:
+        logging.error('Sync failed: %s',exc)
+        sys.exit(1)
