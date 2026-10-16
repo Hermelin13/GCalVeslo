@@ -35,6 +35,10 @@ EXCLUDED = re.compile(
     r"|(?:world|european)\s+(?:[\w-]+\s+){0,8}championships?\b"
     r"|(?:indoor|coastal(?:\s+rowing)?)\s+championships?\b"
     r"|(?:championships?\s+(?:of\s+the\s+)?(?:world|europe))\b"
+    r"|(?:world\s+rowing\s+)?beach\s+sprint\s+(?:series|finals?)\b"
+    r"|(?:yog(?:\s+|[-–—])|youth\s+olympic\s+games\b)"
+    r"|coupe\s+de\s+la\s+jeunesse\b"
+    r"|(?:\d+(?:st|nd|rd|th)\s+)?european\s+games\b"
     r"|(?:mistrovstv[ií]\s+(?:sv[eě]ta|evropy)\s+(?:v|ve)\s+[^,;]+)"
     r")",
     re.I,
@@ -209,10 +213,18 @@ def load_events(session, page, today):
     return list(events.values()),end
 
 
+def canonical_title(title):
+    # ČVS sometimes publishes the same senior control races with and without
+    # a trailing A. Restrict this alias to this event, not other race classes.
+    title = norm(title)
+    if title in ('kontrolní závody seniorů', 'kontrolní závody seniorů a'):
+        return 'kontrolní závody seniorů'
+    return title
+
+
 def event_key(ev):
-    # Same normalized title on the same starting calendar day is one race,
-    # regardless of the reported end date or source workbook.
-    return (norm(ev['summary']), str(ev['start']))
+    # Same canonical title and start date: one race, even across workbooks.
+    return (canonical_title(ev['summary']), str(ev['start']))
 
 
 def credentials():
@@ -241,6 +253,7 @@ def existing_events(service, calendar_id, start, end):
 def sync(service, calendar_id, events, today, until, domestic_color, dry_run=False):
     existing = existing_events(service,calendar_id,today,until)
     keys = set()
+    repeated = {}
     for ev in existing:
         if ev.get('status') == 'cancelled':
             continue
@@ -248,7 +261,12 @@ def sync(service, calendar_id, events, today, until, domestic_color, dry_run=Fal
         # Match both all-day and timed events already in the calendar.
         start = start_info.get('date') or start_info.get('dateTime', '')[:10]
         if start:
-            keys.add((norm(ev.get('summary','')), start))
+            key = (canonical_title(ev.get('summary','')), start)
+            if key in keys:
+                repeated[key] = repeated.get(key, 1) + 1
+            keys.add(key)
+    for (name, day), count in sorted(repeated.items()):
+        LOG.warning('Already duplicated in target calendar: %s | %s | %d occurrences (no deletion)', day, name, count)
     added = skipped = 0
     for ev in sorted(events,key=lambda e:(e['start'],e['summary'])):
         key = tuple(map(str,event_key(ev)))

@@ -32,15 +32,61 @@ class Tests(unittest.TestCase):
             'WRICH 2027', 'WRCH', 'ERICH', 'ERCH', 'WRBSCH',
             'World Rowing Para Rowing Championships',
             'Para Rowing International Regatta', 'Para-veslování',
+            'World Rowing Beach Sprint Series I.kolo',
+            'World Rowing Beach Sprint Finals',
+            'YOG Dakar 2026 - coastal rowing',
+            'Coupe de la Jeunesse 2027', '4th European Games',
         ):
             with self.subTest(name=name):
                 self.assertTrue(EXCLUDED.search(name), name)
-        for name in ('Mistrovství ČR', 'Národní mistrovství', 'Pražské primátorky', 'International Regatta'):
+        for name in ('Mistrovství ČR', 'Národní mistrovství', 'Pražské primátorky', 'International Regatta', 'Kontrolní závody juniorů', 'Kontrolní závody seniorů', 'Kontrolní závody seniorů A', 'Český pohár v beach sprintu'):
             with self.subTest(name=name):
                 self.assertFalse(EXCLUDED.search(name), name)
     def test_same_name_day_even_if_end_differs(self):
         self.assertEqual(event_key(dict(summary='  ČESKÁ  REGATA ', start=date(2027,5,2), end=date(2027,5,3))),
                          event_key(dict(summary='česká regata', start=date(2027,5,2), end=date(2027,5,4))))
+
+    def test_senior_control_race_alias(self):
+        a = dict(summary='Kontrolní závody seniorů A', start=date(2027, 6, 5))
+        b = dict(summary='Kontrolní závody seniorů', start=date(2027, 6, 5))
+        self.assertEqual(event_key(a), event_key(b))
+        self.assertNotEqual(event_key(a), event_key(dict(b, start=date(2027, 6, 6))))
+
+    def test_existing_senior_control_race_alias(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            'items': [{'summary': 'Kontrolní závody seniorů A', 'start': {'date': '2027-06-05'}}]}
+        event = dict(summary='Kontrolní závody seniorů', start=date(2027, 6, 5),
+                     end=date(2027, 6, 7), description='', location='', international=False,
+                     source='https://veslo.cz/a')
+        self.assertEqual(sync(service, 'calendar', [event], date(2027, 1, 1), date(2028, 1, 1), '9'), (0, 1))
+        service.events.return_value.insert.assert_not_called()
+
+    def test_exact_existing_duplicate_is_skipped(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            'items': [
+                {'summary': 'Kontrolní závody seniorů A', 'start': {'date': '2027-06-05'}},
+                {'summary': 'Kontrolní závody seniorů A', 'start': {'date': '2027-06-05'}},
+            ]}
+        event = dict(summary='Kontrolní závody seniorů A', start=date(2027, 6, 5),
+                     end=date(2027, 6, 7), description='', location='', international=False,
+                     source='https://veslo.cz/a')
+        with self.assertLogs('gcalveslo', level='WARNING') as messages:
+            self.assertEqual(sync(service, 'calendar', [event], date(2027, 1, 1), date(2028, 1, 1), '9'), (0, 1))
+        self.assertTrue(any('Already duplicated' in msg for msg in messages.output))
+        service.events.return_value.insert.assert_not_called()
+        service.events.return_value.delete.assert_not_called()
+
+    def test_identical_races_in_same_import_insert_only_once(self):
+        service = Mock()
+        service.events.return_value.list.return_value.execute.return_value = {'items': []}
+        event = dict(summary='Kontrolní závody seniorů A', start=date(2027, 6, 5),
+                     end=date(2027, 6, 7), description='', location='', international=False,
+                     source='https://veslo.cz/a')
+        self.assertEqual(sync(service, 'calendar', [event, dict(event)], date(2027, 1, 1),
+                              date(2028, 1, 1), '9'), (1, 1))
+        self.assertEqual(service.events.return_value.insert.call_count, 1)
 
     def test_duplicate_in_input_only_insert_once(self):
         service = Mock()

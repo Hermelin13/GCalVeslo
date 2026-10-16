@@ -71,3 +71,19 @@ stávající barvy, včetně grafitové (8) pro mezinárodní závody.
 ### Rozšířený filtr mistrovství
 
 Import vynechává také zkratky **MS, ME, WRICH, WRCH, ERICH, ERCH, WRBSCH a WRC** a akce označené **Para Rowing / paraveslování**. České mistrovství ČR a běžné regaty zůstávají povolené. Filtr se uplatní jen na nové importy; již zapsané akce automaticky nemaže.
+
+### Další vyloučené závody (podle zpětné vazby)
+
+Import nyní vynechává také **Kontrolní závody seniorů** (včetně varianty A),
+**World Rowing Beach Sprint Series**, **World Rowing Beach Sprint Finals**,
+**YOG / Youth Olympic Games**, **Coupe de la Jeunesse** a **European Games**.
+Platí to pro nové importy; již zapsané události se automaticky nemažou.
+
+
+### Již existující duplicity v kalendáři
+
+Při každém běhu program také vypíše varování `Already duplicated in target calendar`,
+pokud najde dvě existující události se stejným názvem a datem začátku.
+Další kopie nevytvoří, ale existující záznamy kvůli ochraně ostatních
+událostí automaticky nemaže. Pokud události vidíš dvakrát v Google Calendar,
+ověř, zda obě patří do stejného kalendáře (nejsou z překrývajících se kalendářů).
