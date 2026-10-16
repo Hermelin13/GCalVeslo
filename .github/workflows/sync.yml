@@ -16,6 +16,9 @@ jobs:
     env:
       GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
       GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      SYNC_REPORT_PATH: sync-report.json
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       DOMESTIC_COLOR_ID: ${{ vars.DOMESTIC_COLOR_ID || '9' }}
       ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -43,8 +46,14 @@ jobs:
       - name: Import
         if: steps.check.outputs.run == 'true'
         run: python gcalveslo.py
+      - name: Discord success update
+        if: success() && steps.check.outputs.run == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        run: python notify_discord.py success
+      - name: Discord failure alert
+        if: failure() && env.DISCORD_WEBHOOK_URL != ''
+        run: python notify_discord.py failure
       - name: Email failure alert
-        if: failure()
+        if: failure() && env.SMTP_HOST != '' && env.SMTP_USER != '' && env.SMTP_PASSWORD != '' && env.ALERT_EMAIL != ''
         run: python notify_failure.py
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

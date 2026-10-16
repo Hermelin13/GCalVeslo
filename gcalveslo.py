@@ -271,7 +271,14 @@ def main():
     if not args.calendar:
         raise RuntimeError('GOOGLE_CALENDAR_ID is required')
     service=build('calendar','v3',credentials=credentials(),cache_discovery=False)
-    sync(service,args.calendar,events,today,until,args.domestic_color)
+    added,skipped=sync(service,args.calendar,events,today,until,args.domestic_color)
+    # Only write this report after a fully successful import.
+    report_path=os.environ.get('SYNC_REPORT_PATH')
+    if report_path:
+        import json
+        from pathlib import Path
+        Path(report_path).write_text(json.dumps({'added':added,'skipped':skipped,'loaded':len(events),
+            'from':today.isoformat(),'until':until.isoformat()}),encoding='utf-8')
 
 if __name__=='__main__':
     try: main()

@@ -20,15 +20,22 @@ Na GitHubu v `Settings → Secrets and variables → Actions` nastavte:
 | Secret | `GOOGLE_CREDENTIALS_B64` | Base64 nového JSON service-account klíče |
 | Secret | `GOOGLE_CALENDAR_ID` | ID sdíleného cílového kalendáře |
 | Variable | `DOMESTIC_COLOR_ID` | Číslo 1–11 pro české závody |
-| Secret | `ALERT_EMAIL` | Váš e-mail pro chyby |
+| Secret | `DISCORD_WEBHOOK_URL` | URL Discord webhooku pro oznámení o úspěchu i chybě |
+| Secret | `ALERT_EMAIL` | Váš e-mail pro chyby (volitelné) |
 | Secret | `SMTP_HOST` | Server odchozí pošty, např. `smtp.gmail.com` |
 | Secret | `SMTP_PORT` | `587` (STARTTLS) |
 | Secret | `SMTP_USER` | Odesílací e-mail |
 | Secret | `SMTP_PASSWORD` | Aplikační heslo / SMTP token, nikoli běžné heslo účtu |
 
-Pokud chcete e-mail o chybě, **všechny SMTP položky jsou povinné**. Poštovní údaje se nikdy nedávají do Python souborů.
+E-mail je volitelný: pokud chcete kromě Discordu i e-mail o chybě, **všechny SMTP položky jsou povinné**. Poštovní údaje se nikdy nedávají do Python souborů.
 
 Base64 vytvoříte lokálně například přes `python -c "import base64;print(base64.b64encode(open('new-google-key.json','rb').read()).decode())"`. Výstup vložte pouze do GitHub Secret. U služby Google musí být kalendář sdílený s e-mailovou adresou service account s oprávněním pro úpravy.
+
+## Discord oznámení
+
+V Discordu otevřete nastavení konkrétního kanálu → **Integrace → Webhooky → Nový webhook** (je potřeba oprávnění „Spravovat webhooky“). Klikněte na **Kopírovat URL webhooku** a vložte ji jako GitHub Actions repository secret `DISCORD_WEBHOOK_URL` v **Settings → Secrets and variables → Actions**. Webhook je tajný přístupový údaj; **neposílejte jej nikomu a nedávejte jej do repozitáře**. Pokud unikne, smažte jej a vytvořte nový.
+
+Po každém skutečném importu (včetně ručního spuštění) odešle workflow na Discord zprávu o úspěchu s počtem přidaných, přeskočených a načtených závodů i s odkazem na GitHub Actions. Při selhání některého kroku workflow odešle upozornění na chybu s odkazem na běh. V týdnu, kdy se pravidelný import neprovádí, žádné oznámení neposílá. Discord webhook posílá do **jednoho vybraného kanálu** a nepotřebuje bot token. Pokud `DISCORD_WEBHOOK_URL` není nastaven, Discord oznámení se přeskočí. Při výpadku Discordu může oznámení selhat, i když se závody úspěšně zapsaly; ověřujte stav běhu v GitHub Actions.
 
 ## Spouštění
 
@@ -42,7 +49,7 @@ Instalace lokálně: `pip install -r requirements.txt`. Příkaz `python gcalves
 
 `.gitignore` chrání lokální `.env` soubory, Google service-account klíče, tokeny,
 certifikáty, exporty závodů, dočasné soubory a Python cache. Soubory `requirements.txt`,
-`gcalveslo.py`, `notify_failure.py`, `.github/workflows/sync.yml` a testy se naopak
+`gcalveslo.py`, `notify_failure.py`, `notify_discord.py`, `.github/workflows/sync.yml` a testy se naopak
 verzují. Před prvním push zkontrolujte `git status --short` a `git ls-files`.
 
 **Důležité:** `.gitignore` neodstraní soubory, které již byly commitnuté,

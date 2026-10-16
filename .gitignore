@@ -60,3 +60,6 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+
+# Local synchronization report
+sync-report.json
