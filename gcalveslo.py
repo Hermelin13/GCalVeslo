@@ -2,6 +2,7 @@
 """Synchronize rowing events from ČVS workbooks into Google Calendar."""
 import argparse
 import base64
+import colorsys
 import io
 import logging
 import os
@@ -11,12 +12,12 @@ import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree
 
 import requests
 from bs4 import BeautifulSoup
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 from openpyxl import load_workbook
+from openpyxl.styles.colors import COLOR_INDEX
 
 PAGE = 'https://www.veslo.cz/zavody/terminovky-vypsani-a-rozlosovani?disciplineId=1'
 COLORS = {str(i): name for i, name in enumerate(['', 'Lavender', 'Sage', 'Grape', 'Flamingo', 'Banana', 'Tangerine', 'Peacock', 'Graphite', 'Blueberry', 'Basil', 'Tomato']) if i}
@@ -45,6 +46,110 @@ EXCLUDED = re.compile(
 )
 
 LOG = logging.getLogger('gcalveslo')
+
+# Cancellations must survive parsing so they can also remove previously imported races.
+CANCEL_WORDS = re.compile(
+    r'\b(?:zrušen\w*|zrusen\w*|'
+    r'cancelled|canceled|odvoláno|odvolano|neuskuteční se|neuskutecni se)\b', re.I)
+LEGACY_SOURCE = re.compile(r'(?im)^\s*Zdroj:\s*https://(?:www\.)?veslo\.cz(?:/|$)')
+
+
+def clean_cancelled_title(title):
+    """Remove status banners so 'ZRUŠENO !!! Regata' matches 'Regata'."""
+    cleaned = CANCEL_WORDS.sub('', str(title or ''))
+    return re.sub(r'^[\s!.,:;()\[\]-]+|[\s!.,:;()\[\]-]+$', '', cleaned).strip()
+
+
+def workbook_theme_colors(workbook):
+    """Resolve Excel theme colors, which may be used for cancellation highlights."""
+    if not workbook.loaded_theme:
+        return {}
+    try:
+        root = ElementTree.fromstring(workbook.loaded_theme)
+        ns = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+        scheme = root.find('.//' + ns + 'clrScheme')
+        if scheme is None:
+            return {}
+        theme_names = ('lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2',
+                       'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink')
+        result = {}
+        for idx, name in enumerate(theme_names):
+            entry = scheme.find(ns + name)
+            if entry is not None and len(entry):
+                value = entry[0].get('lastClr') or entry[0].get('val')
+                if value and re.fullmatch(r'[0-9a-fA-F]{6}', value):
+                    result[idx] = value
+        return result
+    except (ElementTree.ParseError, ValueError):
+        return {}
+
+
+def color_rgb(color, theme_colors=None):
+    """Read Excel RGB, indexed and workbook-theme colors."""
+    if color is None:
+        return None
+    kind = getattr(color, 'type', None)
+    if kind == 'rgb':
+        value = getattr(color, 'rgb', None)
+    elif kind == 'indexed':
+        index = getattr(color, 'indexed', None)
+        if not isinstance(index, int) or index >= len(COLOR_INDEX):
+            return None
+        value = COLOR_INDEX[index]
+    elif kind == 'theme':
+        index = getattr(color, 'theme', None)
+        value = (theme_colors or {}).get(index)
+    else:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-fA-F]{6}|[0-9a-fA-F]{8}', value):
+        return None
+    value = value[-6:]
+    rgb = tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
+    # Excel's theme tint increases/decreases perceived lightness.
+    tint = getattr(color, 'tint', 0) or 0
+    if kind == 'theme' and tint:
+        hue, lightness, saturation = colorsys.rgb_to_hls(*(x / 255 for x in rgb))
+        lightness = lightness * (1 + tint) if tint < 0 else lightness + (1 - lightness) * tint
+        rgb = tuple(round(x * 255) for x in colorsys.hls_to_rgb(hue, max(0, min(1, lightness)), saturation))
+    return rgb
+
+
+def is_alert_color(color, theme_colors=None):
+    """Recognize red or yellow, including common pastel Excel warning fills."""
+    rgb = color_rgb(color, theme_colors)
+    if rgb is None:
+        return False
+    hue, saturation, value = colorsys.rgb_to_hsv(*(x / 255 for x in rgb))
+    hue *= 360
+    return (saturation >= 0.15 and
+            (((hue <= 16 or hue >= 344) and value >= 0.30) or
+             (37 <= hue <= 68 and value >= 0.50)))
+
+
+def cancelled_row(row, title_cell, theme_colors=None):
+    """A race is cancelled when explicitly marked in text or Excel styling."""
+    if any(CANCEL_WORDS.search(str(c.value)) for c in row if c.value is not None):
+        return 'status text'
+    # Only inspect real race rows (their dates have already been parsed).
+    # Formatting can cover the whole row or just the name/status cell.
+    for c in row:
+        if c.font and c.font.strike:
+            return 'strikethrough'
+        if c.fill and c.fill.patternType == 'solid' and is_alert_color(c.fill.fgColor, theme_colors):
+            return 'yellow/red highlight'
+        if c.font and is_alert_color(c.font.color, theme_colors):
+            return 'red/yellow text'
+    return None
+
+
+def is_managed_event(event):
+    """Never delete someone's own calendar events, even with same name/date."""
+    private = event.get('extendedProperties', {}).get('private', {})
+    if str(private.get('gcalveslo', '')) == '1':
+        return True
+    # Backwards compatibility for our earlier imports without private marker.
+    return bool(LEGACY_SOURCE.search(str(event.get('description', ''))))
+
 
 
 def norm(s):
@@ -115,6 +220,7 @@ def parse_day(value, year, month):
 def workbook_events(payload, desired_years, start_window, stop_window, source_url):
     wb = load_workbook(io.BytesIO(payload), read_only=False, data_only=True)
     result = []
+    theme_colors = workbook_theme_colors(wb)
     for ws in wb.worksheets:
         sheet_years = [int(y) for y in re.findall(r'20\d{2}', ws.title)]
         if len(sheet_years) == 2 and sheet_years[0] < sheet_years[1] and sheet_years[1] - sheet_years[0] <= 5:
@@ -147,11 +253,6 @@ def workbook_events(payload, desired_years, start_window, stop_window, source_ur
                 if norm(raw_date) in MONTHS:
                     month = MONTHS[norm(raw_date)]
                     continue
-                # Historic Excel: yellow highlighted rows are administrative/non-race rows.
-                flag_cell = row[2] if len(row) > 2 else raw
-                fg = flag_cell.fill.fgColor if flag_cell.fill else None
-                if fg and fg.type == 'rgb' and str(fg.rgb).upper().endswith('FFFF00'):
-                    continue
                 try:
                     parsed = parse_day(raw.value, year, month)
                 except ValueError:
@@ -166,7 +267,10 @@ def workbook_events(payload, desired_years, start_window, stop_window, source_ur
                 name = str(title_cell.value or '').strip() if title_cell else ''
                 if not name or name.casefold() == 'nan':
                     continue
-                if is_excluded(name):
+                reason = cancelled_row(row, title_cell, theme_colors)
+                # Keep excluded races out of import, but retain cancellations:
+                # an older version may have already written the event.
+                if is_excluded(name) and not reason:
                     LOG.info('Excluded from source: %s', name)
                     continue
                 organizer = cell('poradatel')
@@ -176,7 +280,8 @@ def workbook_events(payload, desired_years, start_window, stop_window, source_ur
                 result.append(dict(summary=name, start=first, end=last+timedelta(days=1),
                                    description=str(organizer.value or '').strip() if organizer else '',
                                    location=str(location.value or '').strip() if location else '',
-                                   international=international, source=source_url))
+                                   international=international, source=source_url,
+                                   cancelled=bool(reason), cancel_reason=reason))
     return result
 
 
@@ -207,12 +312,16 @@ def load_events(session, page, today):
             continue
         for ev in items:
             key = event_key(ev)
-            events.setdefault(key, ev)
+            # Cancellation takes precedence across all workbooks, even if a
+            # different edition still contains this race as active.
+            if key not in events or (ev['cancelled'] and not events[key]['cancelled']):
+                events[key] = ev
     if not successfully_read:
         raise RuntimeError('Could not parse any published term list. Calendar unchanged.')
-    LOG.info('Read %d unique races from %d workbooks',len(events),successfully_read)
-    # Last safety check before returning records to any caller.
-    return [ev for ev in events.values() if not is_excluded(ev['summary'])],end
+    LOG.info('Read %d unique races (%d cancelled) from %d workbooks',len(events),
+             sum(e['cancelled'] for e in events.values()),successfully_read)
+    # Keep positively cancelled rows for deletion; never import excluded races.
+    return [ev for ev in events.values() if ev['cancelled'] or not is_excluded(ev['summary'])],end
 
 
 def is_excluded(title):
@@ -223,7 +332,7 @@ def is_excluded(title):
 def canonical_title(title):
     # ČVS sometimes publishes the same senior control races with and without
     # a trailing A. Restrict this alias to this event, not other race classes.
-    title = norm(title)
+    title = norm(clean_cancelled_title(title))
     if title in ('kontrolní závody seniorů', 'kontrolní závody seniorů a'):
         return 'kontrolní závody seniorů'
     return title
@@ -240,6 +349,7 @@ def credentials():
         raise RuntimeError('Set GOOGLE_CREDENTIALS_B64 to base64 encoded service account JSON')
     try:
         import json
+        from google.oauth2 import service_account
         info = json.loads(base64.b64decode(value, validate=True))
         return service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/calendar.events'])
     except Exception as exc:
@@ -258,44 +368,72 @@ def existing_events(service, calendar_id, start, end):
 
 
 def sync(service, calendar_id, events, today, until, domestic_color, dry_run=False):
-    existing = existing_events(service,calendar_id,today,until)
+    existing = existing_events(service, calendar_id, today, until)
     keys = set()
+    by_key = {}
     repeated = {}
     for ev in existing:
         if ev.get('status') == 'cancelled':
             continue
         start_info = ev.get('start', {})
-        # Match both all-day and timed events already in the calendar.
         start = start_info.get('date') or start_info.get('dateTime', '')[:10]
         if start:
-            key = (canonical_title(ev.get('summary','')), start)
+            key = (canonical_title(ev.get('summary', '')), start)
+            by_key.setdefault(key, []).append(ev)
             if key in keys:
                 repeated[key] = repeated.get(key, 1) + 1
             keys.add(key)
     for (name, day), count in sorted(repeated.items()):
-        LOG.warning('Already duplicated in target calendar: %s | %s | %d occurrences (no deletion)', day, name, count)
-    added = skipped = 0
-    for ev in sorted(events,key=lambda e:(e['start'],e['summary'])):
-        # Defense in depth: never write excluded events, even from another importer.
+        LOG.warning('Already duplicated in target calendar: %s | %s | %d occurrences', day, name, count)
+
+    added = skipped = deleted = 0
+    # Process explicit cancellations first, including races which would otherwise
+    # be filtered out. Never delete because an event simply vanished from XLSX.
+    cancelled_keys = {tuple(map(str, event_key(ev))) for ev in events if ev.get('cancelled')}
+    for key in sorted(cancelled_keys):
+        matches = by_key.get(key, [])
+        for old in matches:
+            if not is_managed_event(old):
+                LOG.warning('Cancelled race exists but is not owned by GCalVeslo: %s | %s (left unchanged)', key[1], key[0])
+                continue
+            if not old.get('id'):
+                LOG.warning('Cancelled race has no event ID: %s | %s (left unchanged)', key[1], key[0])
+                continue
+            if not dry_run:
+                # API errors bubble up so GitHub Actions and Discord report failure.
+                service.events().delete(calendarId=calendar_id, eventId=old['id'],
+                                        sendUpdates='none').execute()
+            deleted += 1
+            LOG.info('%s cancelled race: %s | %s', 'Would delete' if dry_run else 'Deleted', key[1], old.get('summary'))
+        keys.add(key)
+
+    for ev in sorted(events, key=lambda e: (e['start'], e['summary'])):
+        key = tuple(map(str, event_key(ev)))
+        if ev.get('cancelled'):
+            LOG.info('Cancelled in source (%s): %s', ev.get('cancel_reason', 'marked'), ev['summary'])
+            skipped += 1
+            continue
         if is_excluded(ev['summary']):
             LOG.info('Excluded before calendar insert: %s', ev['summary'])
             skipped += 1
             continue
-        key = tuple(map(str,event_key(ev)))
-        if key in keys:
+        # Protect against unmerged duplicates supplied directly to sync().
+        if key in keys or key in cancelled_keys:
             skipped += 1
             continue
-        body = {'summary':ev['summary'], 'description': ev['description']+'\nZdroj: '+ev['source'],
-                'location':ev['location'], 'start':{'date':ev['start'].isoformat()},
-                'end':{'date':ev['end'].isoformat()}, 'colorId':'8' if ev['international'] else domestic_color,
-                'reminders':{'useDefault':False,'overrides':[]},
-                'extendedProperties':{'private':{'gcalveslo':'1'}}}
+        body = {'summary': ev['summary'], 'description': ev['description']+'\nZdroj: '+ev['source'],
+                'location': ev['location'], 'start': {'date': ev['start'].isoformat()},
+                'end': {'date': ev['end'].isoformat()}, 'colorId': '8' if ev['international'] else domestic_color,
+                'reminders': {'useDefault': False, 'overrides': []},
+                'extendedProperties': {'private': {'gcalveslo': '1'}}}
         if not dry_run:
-            service.events().insert(calendarId=calendar_id,body=body,sendUpdates='none').execute()
+            service.events().insert(calendarId=calendar_id, body=body, sendUpdates='none').execute()
         keys.add(key)
         added += 1
-    LOG.info('%s: %d, already present: %d, deleted: 0', 'Would add' if dry_run else 'Added',added,skipped)
-    return added,skipped
+    LOG.info('%s: %d, skipped: %d, %s cancelled events: %d',
+             'Would add' if dry_run else 'Added', added, skipped,
+             'would delete' if dry_run else 'deleted', deleted)
+    return added, skipped, deleted
 
 
 def main():
@@ -314,21 +452,26 @@ def main():
     with requests.Session() as session:
         events,until=load_events(session,args.page,today)
     LOG.info('Date window: %s to %s (exclusive)',today,until)
-    LOG.info('Domestic races: %s, foreign races: %s',sum(not x['international'] for x in events),sum(x['international'] for x in events))
+    LOG.info('Domestic races: %s, foreign races: %s, cancelled: %s',
+             sum(not x['international'] and not x.get('cancelled') for x in events),
+             sum(x['international'] and not x.get('cancelled') for x in events),
+             sum(x.get('cancelled', False) for x in events))
     if args.dry_run:
         for e in events:
-            print(f"{e['start']} | {'INT' if e['international'] else 'CZ '} | {e['summary']}")
+            print(f"{e['start']} | {'CANCELLED' if e.get('cancelled') else ('INT' if e['international'] else 'CZ ')} | {e['summary']}")
         return
     if not args.calendar:
         raise RuntimeError('GOOGLE_CALENDAR_ID is required')
+    from googleapiclient.discovery import build
     service=build('calendar','v3',credentials=credentials(),cache_discovery=False)
-    added,skipped=sync(service,args.calendar,events,today,until,args.domestic_color)
+    added,skipped,deleted=sync(service,args.calendar,events,today,until,args.domestic_color)
     # Only write this report after a fully successful import.
     report_path=os.environ.get('SYNC_REPORT_PATH')
     if report_path:
         import json
         from pathlib import Path
-        Path(report_path).write_text(json.dumps({'added':added,'skipped':skipped,'loaded':len(events),
+        Path(report_path).write_text(json.dumps({'added':added,'skipped':skipped,'deleted':deleted,
+            'cancelled':sum(e.get('cancelled', False) for e in events),'loaded':len(events),
             'from':today.isoformat(),'until':until.isoformat()}),encoding='utf-8')
 
 if __name__=='__main__':

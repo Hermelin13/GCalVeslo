@@ -12,6 +12,8 @@ def build_message(status, report=None, run_url=''):
         if report:
             desc = (f"Nově přidáno: **{report['added']}**\n"
                     f"Již existuje (přeskočeno): **{report['skipped']}**\n"
+                    f"Zrušených ve zdroji: **{report.get('cancelled', 0)}**\n"
+                    f"Odstraněno z kalendáře: **{report.get('deleted', 0)}**\n"
                     f"Načteno závodů: **{report['loaded']}**\n"
                     f"Období: {report['from']} až {report['until']} (konec nezahrnut)")
         else:
